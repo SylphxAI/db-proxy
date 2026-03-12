@@ -31,8 +31,8 @@ spec:
         - name: harbor-pull-secret
       containers:
         - name: proxy
-          image: registry.sylphx.com/library/sylphx-db-proxy:latest
-          imagePullPolicy: Always
+          image: registry.sylphx.com/library/sylphx-db-proxy:v1.0.0
+          imagePullPolicy: IfNotPresent
           env:
             - name: DATABASE_URL
               valueFrom:

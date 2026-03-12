@@ -1,4 +1,4 @@
-name: Build & Push
+name: Build & Deploy
 
 on:
   push:
@@ -17,21 +17,29 @@ jobs:
   build:
     runs-on: sylphx-standard
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push to Harbor
         run: |
-          TAG="${{ github.sha }}"
+          SHORT_SHA="${GITHUB_SHA::8}"
           IMAGE="registry.sylphx.com/library/sylphx-db-proxy"
 
-          docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" .
-          docker push "${IMAGE}:${TAG}"
+          docker build -t "${IMAGE}:${SHORT_SHA}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${SHORT_SHA}"
           docker push "${IMAGE}:latest"
 
-      - name: Rollout restart
+          echo "IMAGE_TAG=${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Update deployment manifest
         run: |
-          kubectl rollout restart deploy/sylphx-db-proxy -n sylphx-infra
-          kubectl rollout status deploy/sylphx-db-proxy -n sylphx-infra --timeout=120s
+          sed -i "s|image: registry.sylphx.com/library/sylphx-db-proxy:.*|image: registry.sylphx.com/library/sylphx-db-proxy:${IMAGE_TAG}|" k8s/deployment.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/deployment.yaml
+          git diff --cached --quiet || git commit -m "deploy: ${IMAGE_TAG}"
+          git push
