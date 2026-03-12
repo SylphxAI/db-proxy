@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sylphx-db-proxy
+  namespace: sylphx-infra
+  labels:
+    app: sylphx-db-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: sylphx-db-proxy
+  ports:
+    - name: postgres
+      port: 5432
+      protocol: TCP
+      targetPort: 5432
+    - name: mysql
+      port: 3306
+      protocol: TCP
+      targetPort: 3306

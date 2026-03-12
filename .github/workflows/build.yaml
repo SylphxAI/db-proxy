@@ -1,0 +1,37 @@
+name: Build & Push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Dockerfile"
+      - "package.json"
+      - "bun.lock"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: sylphx-standard
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & push to Harbor
+        run: |
+          TAG="${{ github.sha }}"
+          IMAGE="registry.sylphx.com/library/sylphx-db-proxy"
+
+          docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:latest"
+
+      - name: Rollout restart
+        run: |
+          kubectl rollout restart deploy/sylphx-db-proxy -n sylphx-infra
+          kubectl rollout status deploy/sylphx-db-proxy -n sylphx-infra --timeout=120s

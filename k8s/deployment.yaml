@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sylphx-db-proxy
+  namespace: sylphx-infra
+  labels:
+    app: sylphx-db-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sylphx-db-proxy
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: sylphx-db-proxy
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sylphx-db-proxy
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: harbor-pull-secret
+      containers:
+        - name: proxy
+          image: registry.sylphx.com/library/sylphx-db-proxy:latest
+          imagePullPolicy: Always
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-proxy-config
+                  key: DATABASE_URL
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsUser: 100
+            runAsGroup: 101
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tls-cert
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: tls-cert
+          secret:
+            secretName: db-sylphx-net-wildcard-tls
