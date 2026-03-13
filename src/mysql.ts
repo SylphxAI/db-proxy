@@ -45,7 +45,7 @@
 
 import * as fs from 'node:fs'
 import type { BackendTarget } from './router.ts'
-import { trackConnect, trackDisconnect } from './metrics.ts'
+import { trackConnect, trackDisconnect, trackHandshakeTimeout } from './metrics.ts'
 
 const TLS_BRIDGE_PORT = 13306
 let connectionIdCounter = 1
@@ -53,6 +53,10 @@ let connectionIdCounter = 1
 // Max bytes buffered per connection before handshake completes.
 // Prevents memory exhaustion from slow or malicious clients.
 const MAX_PENDING_BYTES = 1024 * 1024 // 1MB
+
+// Connections that don't complete handshake within this window are dropped.
+// Prevents socket exhaustion from abandoned connections, port scanners, etc.
+const HANDSHAKE_TIMEOUT_MS = 30_000
 
 function pendingSize(bufs: Uint8Array[]): number {
 	let n = 0
@@ -351,6 +355,7 @@ type TlsData = {
 	savedClient: ClientHandshakeInfo | null
 	backendPlugin: string
 	isFirstBackendResponse: boolean
+	handshakeTimer: ReturnType<typeof setTimeout> | null
 }
 
 type PlainData = {
@@ -362,6 +367,7 @@ type PlainData = {
 	realUser: string
 	backendPlugin: string
 	isFirstBackendResponse: boolean
+	handshakeTimer: ReturnType<typeof setTimeout> | null
 }
 
 // ── Main export ────────────────────────────────────────────────────────────
@@ -491,6 +497,10 @@ export function startMysqlProxy(
 
 			socketWrite(socket.data.backend, resp)
 			socket.data.state = 'piping'
+			if (socket.data.handshakeTimer) {
+				clearTimeout(socket.data.handshakeTimer)
+				socket.data.handshakeTimer = null
+			}
 			return
 		}
 
@@ -520,6 +530,11 @@ export function startMysqlProxy(
 					savedClient: null,
 					backendPlugin: 'mysql_native_password',
 					isFirstBackendResponse: false,
+					handshakeTimer: setTimeout(() => {
+						trackHandshakeTimeout()
+						console.warn('[mysql:sni] handshake timeout, dropping connection')
+						socket.end()
+					}, HANDSHAKE_TIMEOUT_MS),
 				}
 			},
 
@@ -572,6 +587,7 @@ export function startMysqlProxy(
 			},
 
 			close(socket) {
+				if (socket.data.handshakeTimer) clearTimeout(socket.data.handshakeTimer)
 				if (socket.data.backend) {
 					socketEnd(socket.data.backend)
 					trackDisconnect('mysql_tls')
@@ -603,6 +619,11 @@ export function startMysqlProxy(
 					realUser: '',
 					backendPlugin: 'mysql_native_password',
 					isFirstBackendResponse: false,
+					handshakeTimer: setTimeout(() => {
+						trackHandshakeTimeout()
+						console.warn('[mysql:plain] handshake timeout, dropping connection')
+						socket.end()
+					}, HANDSHAKE_TIMEOUT_MS),
 				}
 				socket.write(packet)
 			},
@@ -800,6 +821,10 @@ export function startMysqlProxy(
 
 					socketWrite(socket.data.backend, resp)
 					socket.data.state = 'piping'
+					if (socket.data.handshakeTimer) {
+						clearTimeout(socket.data.handshakeTimer)
+						socket.data.handshakeTimer = null
+					}
 					return
 				}
 
@@ -812,6 +837,7 @@ export function startMysqlProxy(
 			},
 
 			close(socket) {
+				if (socket.data.handshakeTimer) clearTimeout(socket.data.handshakeTimer)
 				if (socket.data.bridge) socketEnd(socket.data.bridge)
 				if (socket.data.backend) {
 					socketEnd(socket.data.backend)

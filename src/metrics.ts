@@ -30,6 +30,10 @@ const resolver = {
 	totalMs: 0,
 }
 
+const timeouts = {
+	handshake: 0,
+}
+
 export type ConnType = keyof typeof connections
 
 export function trackConnect(type: ConnType): void {
@@ -55,6 +59,10 @@ export function trackResolverCall(durationMs: number, error = false): void {
 	if (error) resolver.errors++
 }
 
+export function trackHandshakeTimeout(): void {
+	timeouts.handshake++
+}
+
 export function getMetrics(): object {
 	const totalActive = connections.mysql_tls + connections.mysql_plain + connections.pg_tls + connections.pg_plain
 	return {
@@ -69,6 +77,7 @@ export function getMetrics(): object {
 			errors: resolver.errors,
 			avg_ms: resolver.calls > 0 ? Math.round((resolver.totalMs / resolver.calls) * 100) / 100 : 0,
 		},
+		timeouts: { ...timeouts },
 		uptime_s: Math.floor(process.uptime()),
 	}
 }

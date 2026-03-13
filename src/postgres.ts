@@ -18,7 +18,7 @@
 
 import * as fs from 'node:fs'
 import type { BackendTarget } from './router.ts'
-import { trackConnect, trackDisconnect } from './metrics.ts'
+import { trackConnect, trackDisconnect, trackHandshakeTimeout } from './metrics.ts'
 
 const SSL_REQUEST = Buffer.from([0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f])
 const PROTOCOL_V3 = 0x00030000
@@ -27,6 +27,7 @@ const TLS_BRIDGE_PORT = 15432
 // Max bytes buffered per connection before handshake completes.
 // Prevents memory exhaustion from slow or malicious clients.
 const MAX_PENDING_BYTES = 1024 * 1024 // 1MB
+const HANDSHAKE_TIMEOUT_MS = 30_000
 
 function pendingSize(bufs: Uint8Array[]): number {
 	let n = 0
@@ -108,6 +109,7 @@ type TlsData = {
 	sni: string
 	backend: ReturnType<typeof Bun.connect> | null
 	clientBuf: Uint8Array[]
+	handshakeTimer: ReturnType<typeof setTimeout> | null
 }
 
 type PlainData = {
@@ -115,6 +117,7 @@ type PlainData = {
 	bridge: ReturnType<typeof Bun.connect> | null
 	backend: ReturnType<typeof Bun.connect> | null
 	pendingBuf: Uint8Array[]
+	handshakeTimer: ReturnType<typeof setTimeout> | null
 }
 
 // ── Main export ────────────────────────────────────────────────────────────
@@ -135,7 +138,16 @@ export function startPostgresProxy(
 		tls: { cert, key },
 		socket: {
 			open(socket) {
-				socket.data = { sni: '', backend: null, clientBuf: [] }
+				socket.data = {
+					sni: '',
+					backend: null,
+					clientBuf: [],
+					handshakeTimer: setTimeout(() => {
+						trackHandshakeTimeout()
+						console.warn('[pg:tls] handshake timeout, dropping connection')
+						socket.end()
+					}, HANDSHAKE_TIMEOUT_MS),
+				}
 			},
 
 			async handshake(socket, success) {
@@ -170,6 +182,12 @@ export function startPostgresProxy(
 
 				trackConnect('pg_tls')
 				console.log(`[pg:sni] ${id12} -> ${backend.host}:${backend.port}`)
+
+				// Clear handshake timer — we've resolved the backend
+				if (socket.data.handshakeTimer) {
+					clearTimeout(socket.data.handshakeTimer)
+					socket.data.handshakeTimer = null
+				}
 
 				Bun.connect({
 					hostname: backend.host,
@@ -211,6 +229,7 @@ export function startPostgresProxy(
 			},
 
 			close(socket) {
+				if (socket.data.handshakeTimer) clearTimeout(socket.data.handshakeTimer)
 				if (socket.data.backend) {
 					socketEnd(socket.data.backend)
 					trackDisconnect('pg_tls')
@@ -229,7 +248,17 @@ export function startPostgresProxy(
 		port,
 		socket: {
 			open(socket) {
-				socket.data = { state: 'init', bridge: null, backend: null, pendingBuf: [] }
+				socket.data = {
+					state: 'init',
+					bridge: null,
+					backend: null,
+					pendingBuf: [],
+					handshakeTimer: setTimeout(() => {
+						trackHandshakeTimeout()
+						console.warn('[pg:plain] handshake timeout, dropping connection')
+						socket.end()
+					}, HANDSHAKE_TIMEOUT_MS),
+				}
 			},
 
 			data(socket, rawData) {
@@ -243,6 +272,11 @@ export function startPostgresProxy(
 					if (d.equals(SSL_REQUEST)) {
 						socket.write('S')
 						socket.data.state = 'bridging'
+						// TLS bridge has its own handshake timer
+						if (socket.data.handshakeTimer) {
+							clearTimeout(socket.data.handshakeTimer)
+							socket.data.handshakeTimer = null
+						}
 						Bun.connect({
 							hostname: '127.0.0.1',
 							port: TLS_BRIDGE_PORT,
@@ -287,6 +321,11 @@ export function startPostgresProxy(
 										return
 									}
 
+									// Handshake complete — backend resolved
+									if (socket.data.handshakeTimer) {
+										clearTimeout(socket.data.handshakeTimer)
+										socket.data.handshakeTimer = null
+									}
 									trackConnect('pg_plain')
 									console.log(`[pg:plain] ${id12} (${realUser}) -> ${backend.host}:${backend.port}`)
 									const rewritten = rewriteStartupUser(d, realUser)
@@ -373,6 +412,7 @@ export function startPostgresProxy(
 			},
 
 			close(socket) {
+				if (socket.data.handshakeTimer) clearTimeout(socket.data.handshakeTimer)
 				if (socket.data.bridge) socketEnd(socket.data.bridge)
 				if (socket.data.backend) {
 					socketEnd(socket.data.backend)

@@ -92,6 +92,16 @@ export function getCacheSize(): number {
 	return cache.size
 }
 
+/** Deep health check — verifies the Platform DB connection is alive */
+export async function checkHealth(): Promise<boolean> {
+	try {
+		await withTimeout(sql`SELECT 1`, 3_000, 'health-check')
+		return true
+	} catch {
+		return false
+	}
+}
+
 // ── Resolver timeout ────────────────────────────────────────────────────────
 
 const RESOLVE_TIMEOUT_MS = 5_000
@@ -127,9 +137,17 @@ export async function resolveDatabase(id12: string): Promise<BackendTarget | nul
 	}
 	trackCacheMiss()
 
-	// Convert 12-char hex prefix back to UUID prefix for index scan.
-	// UUID format: xxxxxxxx-xxxx-... → first 12 hex chars span groups 1+2.
-	const uuidPrefix = `${id12.slice(0, 8)}-${id12.slice(8, 12)}`
+	// Convert 12-char hex prefix to UUID range bounds for a proper PK index scan.
+	// Old approach: `WHERE id::text LIKE '...'` — casts UUID to text, can't use the
+	// UUID btree index → sequential scan. New approach: construct exact UUID bounds
+	// so Postgres uses the PK index directly (O(log n) vs O(n)).
+	//
+	// id12 = "25e3b05c46dc" → lower: 25e3b05c-46dc-0000-0000-000000000000
+	//                        → upper: 25e3b05c-46dd-0000-0000-000000000000
+	const lower = `${id12.slice(0, 8)}-${id12.slice(8, 12)}-0000-0000-000000000000`
+	const num = BigInt(`0x${id12}`) + 1n
+	const nextHex = num.toString(16).padStart(12, '0')
+	const upper = `${nextHex.slice(0, 8)}-${nextHex.slice(8, 12)}-0000-0000-000000000000`
 
 	const t0 = performance.now()
 	let rows: { provider: string; cluster_name: string; host: string | null; port: number | null }[]
@@ -138,7 +156,7 @@ export async function resolveDatabase(id12: string): Promise<BackendTarget | nul
 			sql<{ provider: string; cluster_name: string; host: string | null; port: number | null }[]>`
 				SELECT provider, cluster_name, host, port
 				FROM database_resources
-				WHERE id::text LIKE ${`${uuidPrefix}%`}
+				WHERE id >= ${lower}::uuid AND id < ${upper}::uuid
 				LIMIT 1
 			`,
 			RESOLVE_TIMEOUT_MS,
