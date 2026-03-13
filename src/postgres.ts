@@ -18,10 +18,21 @@
 
 import * as fs from 'node:fs'
 import type { BackendTarget } from './router.ts'
+import { trackConnect, trackDisconnect } from './metrics.ts'
 
 const SSL_REQUEST = Buffer.from([0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f])
 const PROTOCOL_V3 = 0x00030000
 const TLS_BRIDGE_PORT = 15432
+
+// Max bytes buffered per connection before handshake completes.
+// Prevents memory exhaustion from slow or malicious clients.
+const MAX_PENDING_BYTES = 1024 * 1024 // 1MB
+
+function pendingSize(bufs: Uint8Array[]): number {
+	let n = 0
+	for (const b of bufs) n += b.length
+	return n
+}
 
 function buildPgError(code: string, message: string): Buffer {
 	const body = Buffer.from(`SERROR\0C${code}\0M${message}\0\0`)
@@ -77,6 +88,18 @@ function rewriteStartupUser(data: Buffer, newUser: string): Buffer {
 	result.writeUInt32BE(PROTOCOL_V3, 4)
 	paramsBuf.copy(result, 8)
 	return result
+}
+
+// ── Socket write helper ────────────────────────────────────────────────────
+// Bun.connect returns a typed socket but TypeScript doesn't expose write/end
+// cleanly across the plain↔TLS boundary. This helper avoids scattered `as any`.
+
+function socketWrite(sock: unknown, data: Uint8Array): void {
+	;(sock as { write(d: Uint8Array): void }).write(data)
+}
+
+function socketEnd(sock: unknown): void {
+	;(sock as { end(): void }).end()
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -145,6 +168,7 @@ export function startPostgresProxy(
 					return
 				}
 
+				trackConnect('pg_tls')
 				console.log(`[pg:sni] ${id12} -> ${backend.host}:${backend.port}`)
 
 				Bun.connect({
@@ -163,7 +187,9 @@ export function startPostgresProxy(
 							socket.end()
 						},
 						error(_, e) {
-							console.error(`[pg:sni] backend error ${id12}:`, e.message)
+							if (e.message !== 'ECONNRESET') {
+								console.error(`[pg:sni] backend error ${id12}:`, e.message)
+							}
 							socket.end()
 						},
 					},
@@ -172,14 +198,23 @@ export function startPostgresProxy(
 
 			data(socket, rawData) {
 				if (socket.data.backend) {
-					;(socket.data.backend as unknown as { write: (d: Uint8Array) => void }).write(rawData)
+					socketWrite(socket.data.backend, rawData)
 				} else {
-					socket.data.clientBuf.push(rawData.slice())
+					// Deep copy — Bun may reuse the rawData buffer after callback returns
+					if (pendingSize(socket.data.clientBuf) + rawData.length > MAX_PENDING_BYTES) {
+						console.warn('[pg:tls] client buffer overflow, dropping connection')
+						socket.end()
+						return
+					}
+					socket.data.clientBuf.push(Buffer.from(rawData))
 				}
 			},
 
 			close(socket) {
-				;(socket.data.backend as unknown as { end: () => void } | null)?.end()
+				if (socket.data.backend) {
+					socketEnd(socket.data.backend)
+					trackDisconnect('pg_tls')
+				}
 			},
 
 			error(_, err) {
@@ -252,6 +287,7 @@ export function startPostgresProxy(
 										return
 									}
 
+									trackConnect('pg_plain')
 									console.log(`[pg:plain] ${id12} (${realUser}) -> ${backend.host}:${backend.port}`)
 									const rewritten = rewriteStartupUser(d, realUser)
 
@@ -265,7 +301,6 @@ export function startPostgresProxy(
 												socket.data.pendingBuf.length = 0
 												socket.data.backend = back as unknown as ReturnType<typeof Bun.connect>
 											},
-											// Auth challenge/response + all query traffic relayed transparently
 											data(_, d) {
 												socket.write(d)
 											},
@@ -273,7 +308,9 @@ export function startPostgresProxy(
 												socket.end()
 											},
 											error(_, e) {
-												console.error(`[pg:plain] backend error ${id12}:`, e.message)
+												if (e.message !== 'ECONNRESET') {
+													console.error(`[pg:plain] backend error ${id12}:`, e.message)
+												}
 												socket.end()
 											},
 										},
@@ -306,9 +343,15 @@ export function startPostgresProxy(
 				// ── SNI/TLS mode pipe ─────────────────────────────────────
 				if (state === 'bridging') {
 					if (socket.data.bridge) {
-						;(socket.data.bridge as unknown as { write: (d: Uint8Array) => void }).write(rawData)
+						socketWrite(socket.data.bridge, rawData)
 					} else {
-						socket.data.pendingBuf.push(rawData.slice())
+						if (pendingSize(socket.data.pendingBuf) + rawData.length > MAX_PENDING_BYTES) {
+							console.warn('[pg] bridge buffer overflow, dropping connection')
+							socket.end()
+							return
+						}
+						// Deep copy — Bun may reuse the rawData buffer after callback returns
+						socket.data.pendingBuf.push(Buffer.from(rawData))
 					}
 					return
 				}
@@ -316,16 +359,25 @@ export function startPostgresProxy(
 				// ── Plaintext mode pipe ───────────────────────────────────
 				if (state === 'plaintext') {
 					if (socket.data.backend) {
-						;(socket.data.backend as unknown as { write: (d: Uint8Array) => void }).write(rawData)
+						socketWrite(socket.data.backend, rawData)
 					} else {
-						socket.data.pendingBuf.push(rawData.slice())
+						if (pendingSize(socket.data.pendingBuf) + rawData.length > MAX_PENDING_BYTES) {
+							console.warn('[pg:plain] pending buffer overflow, dropping connection')
+							socket.end()
+							return
+						}
+						// Deep copy — Bun may reuse the rawData buffer after callback returns
+						socket.data.pendingBuf.push(Buffer.from(rawData))
 					}
 				}
 			},
 
 			close(socket) {
-				;(socket.data.bridge as unknown as { end: () => void } | null)?.end()
-				;(socket.data.backend as unknown as { end: () => void } | null)?.end()
+				if (socket.data.bridge) socketEnd(socket.data.bridge)
+				if (socket.data.backend) {
+					socketEnd(socket.data.backend)
+					trackDisconnect('pg_plain')
+				}
 			},
 
 			error(_, err) {

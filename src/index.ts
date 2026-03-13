@@ -18,6 +18,7 @@
 import { startMysqlProxy } from './mysql.ts'
 import { startPostgresProxy } from './postgres.ts'
 import { resolveDatabase } from './router.ts'
+import { getMetrics } from './metrics.ts'
 
 const TLS_CERT_PATH = process.env.TLS_CERT_PATH ?? '/certs/tls.crt'
 const TLS_KEY_PATH = process.env.TLS_KEY_PATH ?? '/certs/tls.key'
@@ -30,7 +31,7 @@ startPostgresProxy(PG_PORT, TLS_CERT_PATH, TLS_KEY_PATH, resolveDatabase)
 // Start MySQL proxy (plain TCP :3306 → bridge → internal TLS :13306 → Percona)
 startMysqlProxy(MYSQL_PORT, TLS_CERT_PATH, TLS_KEY_PATH, resolveDatabase)
 
-// Health check (HTTP :8080 /health for K8s probes)
+// Health + metrics endpoint (HTTP :8080)
 Bun.serve({
 	port: 8080,
 	fetch(req) {
@@ -38,15 +39,19 @@ Bun.serve({
 		if (url.pathname === '/health') {
 			return new Response('ok', { status: 200 })
 		}
+		if (url.pathname === '/metrics') {
+			return Response.json(getMetrics())
+		}
 		return new Response('not found', { status: 404 })
 	},
 })
 
-console.log('[health] HTTP health endpoint on :8080')
+console.log('[health] HTTP health + metrics endpoint on :8080')
 
 console.log(`[startup] sylphx-db-proxy ready
   Postgres : *.db.sylphx.net:${PG_PORT}
   MySQL    : *.db.sylphx.net:${MYSQL_PORT}
+  Metrics  : :8080/metrics
   Routing  : SNI id[:12] -> database_resources -> K8s internal host`)
 
 // Graceful shutdown

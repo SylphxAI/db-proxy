@@ -1,16 +1,26 @@
 /**
  * Database Router
  *
- * Resolves a 12-char hex ID (from SNI hostname) to a backend K8s service.
- * Backed by a TTL cache with a hard entry cap to prevent memory DoS.
+ * Resolves a 12-char hex ID (from SNI hostname or user@id12) to a backend
+ * K8s service address. Backed by an LRU cache with hard entry cap.
  *
  * Cache semantics:
  *   - Hit (valid DB):   TTL 60s — reduces Platform DB load for active connections
  *   - Miss (not found): TTL 10s — limits DB hammering from bad/unknown IDs
- *   - Cap: 1 000 entries — evicts oldest on overflow
+ *   - Cap: 1 000 entries — evicts least-recently-used on overflow
+ *
+ * Pool sizing:
+ *   max: 20 — this proxy is the gateway for ALL managed databases. Under burst
+ *   load (cold start, cache expiry storm), many connections resolve concurrently.
+ *   5 was too low — caused queueing under moderate load.
+ *
+ * Resolver timeout:
+ *   5s — if Platform DB is unresponsive, fail fast rather than blocking the
+ *   proxy's connection handling indefinitely.
  */
 
 import postgres from 'postgres'
+import { trackCacheHit, trackCacheMiss, trackResolverCall } from './metrics.ts'
 
 export interface BackendTarget {
 	host: string
@@ -22,7 +32,7 @@ const DB_URL = process.env.DATABASE_URL
 if (!DB_URL) throw new Error('DATABASE_URL is required')
 
 const sql = postgres(DB_URL, {
-	max: 5,
+	max: 20,
 	idle_timeout: 30,
 	connect_timeout: 10,
 })
@@ -36,55 +46,112 @@ function isValidId12(id12: string): boolean {
 	return ID12_RE.test(id12)
 }
 
-// ── TTL + capped cache ───────────────────────────────────────────────────────
+// ── LRU + TTL cache ─────────────────────────────────────────────────────────
 
 type CacheEntry = { value: BackendTarget | null; expiresAt: number }
 
 const cache = new Map<string, CacheEntry>()
-const CACHE_HIT_TTL_MS = 60_000 // 60s for known databases
-const CACHE_MISS_TTL_MS = 10_000 // 10s for unknown / not-found IDs
+const CACHE_HIT_TTL_MS = 60_000
+const CACHE_MISS_TTL_MS = 10_000
 const CACHE_MAX_ENTRIES = 1_000
 
 /**
- * Insert into cache. When the map is full, evict the oldest entry (FIFO).
- * Map iteration order is insertion order in V8/Bun, so the first key is oldest.
+ * LRU cache get. On access, deletes and re-inserts the entry so it moves
+ * to the end of Map iteration order (most-recently-used position).
+ * Returns undefined if not found or expired.
+ */
+function cacheGet(id12: string): CacheEntry | undefined {
+	const entry = cache.get(id12)
+	if (!entry) return undefined
+	if (entry.expiresAt <= Date.now()) {
+		cache.delete(id12)
+		return undefined
+	}
+	// Move to end (most-recently-used)
+	cache.delete(id12)
+	cache.set(id12, entry)
+	return entry
+}
+
+/**
+ * LRU cache set. When full, evicts the least-recently-used entry (first key
+ * in Map iteration order — oldest access).
  */
 function cacheSet(id12: string, entry: CacheEntry): void {
-	if (cache.size >= CACHE_MAX_ENTRIES && !cache.has(id12)) {
-		// Evict oldest entry
-		const oldestKey = cache.keys().next().value
-		if (oldestKey !== undefined) cache.delete(oldestKey)
+	// Delete first so re-insert goes to end
+	cache.delete(id12)
+	if (cache.size >= CACHE_MAX_ENTRIES) {
+		const lruKey = cache.keys().next().value
+		if (lruKey !== undefined) cache.delete(lruKey)
 	}
 	cache.set(id12, entry)
+}
+
+/** Expose cache size for metrics endpoint */
+export function getCacheSize(): number {
+	return cache.size
+}
+
+// ── Resolver timeout ────────────────────────────────────────────────────────
+
+const RESOLVE_TIMEOUT_MS = 5_000
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+		promise.then(
+			(v) => {
+				clearTimeout(timer)
+				resolve(v)
+			},
+			(e) => {
+				clearTimeout(timer)
+				reject(e)
+			},
+		)
+	})
 }
 
 // ── Resolver ─────────────────────────────────────────────────────────────────
 
 export async function resolveDatabase(id12: string): Promise<BackendTarget | null> {
-	// Validate before hitting the DB — rejects malformed / injection attempts
 	if (!isValidId12(id12)) {
 		console.warn(`[router] invalid id12 format: "${id12}"`)
 		return null
 	}
 
-	const now = Date.now()
-	const cached = cache.get(id12)
-	if (cached && cached.expiresAt > now) return cached.value
+	const cached = cacheGet(id12)
+	if (cached) {
+		trackCacheHit()
+		return cached.value
+	}
+	trackCacheMiss()
 
-	// Convert 12-char hex prefix back to UUID prefix for a proper index scan.
-	// UUID format: xxxxxxxx-xxxx-... → first 12 hex chars span groups 1+2+half of 3.
-	// We match on the text representation: xxxxxxxx-xxxx (12 hex chars = 8+4).
+	// Convert 12-char hex prefix back to UUID prefix for index scan.
+	// UUID format: xxxxxxxx-xxxx-... → first 12 hex chars span groups 1+2.
 	const uuidPrefix = `${id12.slice(0, 8)}-${id12.slice(8, 12)}`
 
-	const rows = await sql<{ provider: string; cluster_name: string; host: string | null; port: number | null }[]>`
-		SELECT provider, cluster_name, host, port
-		FROM database_resources
-		WHERE id::text LIKE ${`${uuidPrefix}%`}
-		LIMIT 1
-	`
+	const t0 = performance.now()
+	let rows: { provider: string; cluster_name: string; host: string | null; port: number | null }[]
+	try {
+		rows = await withTimeout(
+			sql<{ provider: string; cluster_name: string; host: string | null; port: number | null }[]>`
+				SELECT provider, cluster_name, host, port
+				FROM database_resources
+				WHERE id::text LIKE ${`${uuidPrefix}%`}
+				LIMIT 1
+			`,
+			RESOLVE_TIMEOUT_MS,
+			`resolve(${id12})`,
+		)
+		trackResolverCall(performance.now() - t0)
+	} catch (err) {
+		trackResolverCall(performance.now() - t0, true)
+		throw err
+	}
 
 	if (rows.length === 0) {
-		cacheSet(id12, { value: null, expiresAt: now + CACHE_MISS_TTL_MS })
+		cacheSet(id12, { value: null, expiresAt: Date.now() + CACHE_MISS_TTL_MS })
 		return null
 	}
 
@@ -112,7 +179,7 @@ export async function resolveDatabase(id12: string): Promise<BackendTarget | nul
 		provider: provider as 'cnpg' | 'percona',
 	}
 
-	cacheSet(id12, { value: target, expiresAt: now + CACHE_HIT_TTL_MS })
+	cacheSet(id12, { value: target, expiresAt: Date.now() + CACHE_HIT_TTL_MS })
 	console.log(`[router] ${id12} → ${target.host}:${target.port}`)
 	return target
 }

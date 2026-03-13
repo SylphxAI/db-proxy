@@ -45,9 +45,31 @@
 
 import * as fs from 'node:fs'
 import type { BackendTarget } from './router.ts'
+import { trackConnect, trackDisconnect } from './metrics.ts'
 
 const TLS_BRIDGE_PORT = 13306
 let connectionIdCounter = 1
+
+// Max bytes buffered per connection before handshake completes.
+// Prevents memory exhaustion from slow or malicious clients.
+const MAX_PENDING_BYTES = 1024 * 1024 // 1MB
+
+function pendingSize(bufs: Uint8Array[]): number {
+	let n = 0
+	for (const b of bufs) n += b.length
+	return n
+}
+
+// ── Socket write helper ────────────────────────────────────────────────────
+// Avoids scattered `as unknown as { write: ... }` type casts throughout.
+
+function socketWrite(sock: unknown, data: Uint8Array): void {
+	;(sock as { write(d: Uint8Array): void }).write(data)
+}
+
+function socketEnd(sock: unknown): void {
+	;(sock as { end(): void }).end()
+}
 
 // ── MySQL packet helpers ───────────────────────────────────────────────────
 
@@ -56,53 +78,56 @@ function writePktHeader(buf: Buffer, payloadLen: number, seqId: number) {
 	buf[3] = seqId & 0xff
 }
 
+// Pre-computed constants for buildFakeHandshakeV10
+const FAKE_VERSION = Buffer.from('8.0.36\0')
+const FAKE_PLUGIN = Buffer.from('caching_sha2_password\0')
+// Match real MySQL 8.0 server capabilities (Percona 8.0.45 advertises 0xdfffffff)
+// Exclude MULTI_FACTOR_AUTH, QUERY_ATTRIBUTES, DEPRECATE_EOF — MySQL 9.x features
+// that change the auth handshake in ways the proxy doesn't support
+const CAP_LO = 0xffff
+const CAP_HI = 0xc6ff
+
 function buildFakeHandshakeV10(connectionId: number): { packet: Buffer; salt: Buffer } {
 	const salt = Buffer.allocUnsafe(20)
 	crypto.getRandomValues(salt)
-	const authData1 = salt.subarray(0, 8)
-	const authData2 = salt.subarray(8, 20)
 
-	const version = Buffer.from('8.0.36\0')
-	const connIdBuf = Buffer.allocUnsafe(4)
-	connIdBuf.writeUInt32LE(connectionId)
+	// Pre-calculate payload size:
+	// 1 (proto) + 7 (version) + 4 (connId) + 8 (salt1) + 1 (filler)
+	// + 2 (capLo) + 1 (charset) + 2 (status) + 2 (capHi) + 1 (authLen)
+	// + 10 (reserved) + 12 (salt2) + 1 (null) + 22 (plugin) = 74
+	const payloadLen = 74
+	const pkt = Buffer.allocUnsafe(4 + payloadLen)
+	writePktHeader(pkt, payloadLen, 0)
 
-	// Match real MySQL 8.0 server capabilities (Percona 8.0.45 advertises 0xdfffffff)
-	// Required: SSL (0x0800), PROTOCOL_41 (0x0200), SECURE_CONNECTION (0x8000),
-	//   PLUGIN_AUTH (0x00080000), CONNECT_WITH_DB (0x0008)
-	const capLo = 0xffff
-	// Exclude MULTI_FACTOR_AUTH (0x10000000), QUERY_ATTRIBUTES (0x08000000), DEPRECATE_EOF (0x01000000)
-	// These MySQL 9.x features change the auth handshake in ways the proxy doesn't support
-	const capHi = 0xc6ff
-	const capLoBuf = Buffer.allocUnsafe(2)
-	capLoBuf.writeUInt16LE(capLo)
-	const capHiBuf = Buffer.allocUnsafe(2)
-	capHiBuf.writeUInt16LE(capHi)
+	let off = 4
+	pkt[off++] = 0x0a // protocol version
+	FAKE_VERSION.copy(pkt, off)
+	off += FAKE_VERSION.length
+	pkt.writeUInt32LE(connectionId, off)
+	off += 4
+	salt.copy(pkt, off, 0, 8) // auth_plugin_data_part_1
+	off += 8
+	pkt[off++] = 0x00 // filler
+	pkt.writeUInt16LE(CAP_LO, off)
+	off += 2
+	pkt[off++] = 0x21 // charset utf8mb4
+	pkt.writeUInt16LE(0x0002, off) // status_flags
+	off += 2
+	pkt.writeUInt16LE(CAP_HI, off)
+	off += 2
+	pkt[off++] = 21 // auth_plugin_data_len (8+12+1=21)
+	pkt.fill(0, off, off + 10) // reserved
+	off += 10
+	salt.copy(pkt, off, 8, 20) // auth_plugin_data_part_2
+	off += 12
+	pkt[off++] = 0x00 // null terminator for part2
+	FAKE_PLUGIN.copy(pkt, off) // caching_sha2_password\0
+	// off += FAKE_PLUGIN.length
 
-	const payload = Buffer.concat([
-		Buffer.from([0x0a]), // protocol version
-		version, // server version
-		connIdBuf, // connection_id
-		authData1, // auth_plugin_data_part_1 (8 bytes)
-		Buffer.from([0x00]), // filler
-		capLoBuf, // capability_flags_1
-		Buffer.from([0x21]), // character_set (utf8mb4)
-		Buffer.from([0x02, 0x00]), // status_flags
-		capHiBuf, // capability_flags_2
-		Buffer.from([21]), // auth_plugin_data_len (8+12+1=21)
-		Buffer.alloc(10), // reserved
-		authData2, // auth_plugin_data_part_2 (12 bytes)
-		Buffer.from([0x00]), // null terminator for part2
-		Buffer.from('caching_sha2_password\0'), // Use caching_sha2 in greeting so AuthSwitchRequest to mysql_native_password is a genuine plugin change (MySQL 9.x rejects same-plugin switches)
-	])
-
-	const packet = Buffer.allocUnsafe(4 + payload.length)
-	writePktHeader(packet, payload.length, 0)
-	payload.copy(packet, 4)
-	return { packet, salt }
+	return { packet: pkt, salt }
 }
 
 function isSslRequest(data: Buffer): boolean {
-	// SSL request: 32-byte packet with seq=1 and CLIENT_SSL bit set
 	if (data.length < 36) return false
 	const len = data.readUIntLE(0, 3)
 	if (len !== 32) return false
@@ -129,7 +154,6 @@ function parseHandshakeResponse41(data: Buffer): ClientHandshakeInfo | null {
 	const capabilities = p.readUInt32LE(0)
 	const maxPacketSize = p.readUInt32LE(4)
 	const charset = p[8]
-	// bytes 9-31: reserved
 
 	let offset = 32
 
@@ -184,11 +208,9 @@ function parseBackendHandshakeV10(data: Buffer): BackendGreeting | null {
 	const pktLen = data.readUIntLE(0, 3)
 	if (data.length < 4 + pktLen) return null
 	const p = data.subarray(4, 4 + pktLen)
-	if (p.length < 33 || p[0] !== 0x0a) return null // not HandshakeV10
+	if (p.length < 33 || p[0] !== 0x0a) return null
 
-	// skip protocol version byte
 	let offset = 1
-	// skip server version (null-terminated)
 	const vEnd = p.indexOf(0, offset)
 	if (vEnd < 0) return null
 	offset = vEnd + 1 + 4 // +4 for connection_id
@@ -222,15 +244,17 @@ function parseBackendHandshakeV10(data: Buffer): BackendGreeting | null {
 
 /** AuthSwitchRequest: 0xFE + plugin_name\0 + auth_plugin_data + \0 */
 function buildAuthSwitchRequest(plugin: string, salt: Buffer, seqId: number): Buffer {
-	const payload = Buffer.concat([
-		Buffer.from([0xfe]),
-		Buffer.from(`${plugin}\0`, 'utf8'),
-		salt,
-		Buffer.from([0x00]), // Null terminator after salt — required by MySQL 9.x clients
-	])
-	const pkt = Buffer.allocUnsafe(4 + payload.length)
-	writePktHeader(pkt, payload.length, seqId)
-	payload.copy(pkt, 4)
+	const pluginBuf = Buffer.from(`${plugin}\0`, 'utf8')
+	const payloadLen = 1 + pluginBuf.length + salt.length + 1
+	const pkt = Buffer.allocUnsafe(4 + payloadLen)
+	writePktHeader(pkt, payloadLen, seqId)
+	let off = 4
+	pkt[off++] = 0xfe
+	pluginBuf.copy(pkt, off)
+	off += pluginBuf.length
+	salt.copy(pkt, off)
+	off += salt.length
+	pkt[off] = 0x00 // Null terminator after salt — required by MySQL 9.x clients
 	return pkt
 }
 
@@ -259,34 +283,39 @@ function buildHandshakeResponse41(opts: {
 		0x00080000 | // CLIENT_PLUGIN_AUTH
 		0x00200000 // CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
 
-	const capBuf = Buffer.allocUnsafe(4)
-	capBuf.writeUInt32LE(CAP)
-	const maxPktBuf = Buffer.allocUnsafe(4)
-	maxPktBuf.writeUInt32LE(opts.maxPacketSize || 16777216)
-	// MySQL HandshakeResponse41 fixed header: 4 (caps) + 4 (max_pkt) + 1 (charset) + 23 (reserved) = 32
-	const reserved = Buffer.alloc(24)
-	reserved[0] = opts.charset
-
+	const userBuf = Buffer.from(`${opts.username}\0`, 'utf8')
 	const dbBuf = opts.database ? Buffer.from(`${opts.database}\0`) : Buffer.from([0x00])
+	const pluginBuf = Buffer.from(`${opts.authPlugin}\0`, 'utf8')
 
-	const payload = Buffer.concat([
-		capBuf,
-		maxPktBuf,
-		reserved,
-		Buffer.from(`${opts.username}\0`),
-		Buffer.from([opts.authResponse.length]),
-		opts.authResponse,
-		dbBuf,
-		Buffer.from(`${opts.authPlugin}\0`),
-	])
+	// Fixed: 4 (caps) + 4 (max_pkt) + 1 (charset) + 23 (reserved) = 32
+	const payloadLen = 32 + userBuf.length + 1 + opts.authResponse.length + dbBuf.length + pluginBuf.length
+	const pkt = Buffer.allocUnsafe(4 + payloadLen)
+	writePktHeader(pkt, payloadLen, 1) // seq=1
 
-	const pkt = Buffer.allocUnsafe(4 + payload.length)
-	writePktHeader(pkt, payload.length, 1) // seq=1 (response to backend greeting)
-	payload.copy(pkt, 4)
+	let off = 4
+	pkt.writeUInt32LE(CAP, off)
+	off += 4
+	pkt.writeUInt32LE(opts.maxPacketSize || 16777216, off)
+	off += 4
+	pkt[off++] = opts.charset
+	pkt.fill(0, off, off + 23) // reserved
+	off += 23
+	userBuf.copy(pkt, off)
+	off += userBuf.length
+	pkt[off++] = opts.authResponse.length
+	opts.authResponse.copy(pkt, off)
+	off += opts.authResponse.length
+	dbBuf.copy(pkt, off)
+	off += dbBuf.length
+	pluginBuf.copy(pkt, off)
+
 	return pkt
 }
 
-/** Patch the seq byte in a MySQL packet */
+/**
+ * Patch the seq byte in a MySQL packet.
+ * Must copy — Bun owns the original rawData buffer and may reuse it.
+ */
 function patchSeq(data: Uint8Array, newSeq: number): Buffer {
 	const buf = Buffer.from(data)
 	buf[3] = newSeq & 0xff
@@ -294,17 +323,18 @@ function patchSeq(data: Uint8Array, newSeq: number): Buffer {
 }
 
 function buildMysqlError(message: string, seqId = 2): Buffer {
-	const msg = Buffer.from(message, 'utf8')
-	const payload = Buffer.concat([
-		Buffer.from([0xff]), // ERR_Packet
-		Buffer.from([0x15, 0x04]), // error code 1045
-		Buffer.from('#'), // sql state marker
-		Buffer.from('28000'), // sql state
-		msg,
-	])
-	const pkt = Buffer.allocUnsafe(4 + payload.length)
-	writePktHeader(pkt, payload.length, seqId)
-	payload.copy(pkt, 4)
+	const msgBuf = Buffer.from(message, 'utf8')
+	const payloadLen = 1 + 2 + 1 + 5 + msgBuf.length
+	const pkt = Buffer.allocUnsafe(4 + payloadLen)
+	writePktHeader(pkt, payloadLen, seqId)
+	let off = 4
+	pkt[off++] = 0xff // ERR_Packet
+	pkt.writeUInt16LE(0x0415, off) // error code 1045
+	off += 2
+	pkt[off++] = 0x23 // '#' sql state marker
+	pkt.write('28000', off, 'ascii') // sql state
+	off += 5
+	msgBuf.copy(pkt, off)
 	return pkt
 }
 
@@ -328,11 +358,10 @@ type PlainData = {
 	bridge: ReturnType<typeof Bun.connect> | null
 	backend: ReturnType<typeof Bun.connect> | null
 	pendingBuf: Uint8Array[]
-	// saved during plaintext handshake
 	savedClient: ClientHandshakeInfo | null
 	realUser: string
 	backendPlugin: string
-	isFirstBackendResponse: boolean // seq rewrite needed only for first packet after auth
+	isFirstBackendResponse: boolean
 }
 
 // ── Main export ────────────────────────────────────────────────────────────
@@ -356,7 +385,12 @@ export function startMysqlProxy(
 		if (state === 'wait_client_handshake') {
 			if (!socket.data.handshakeResolved) {
 				// handshake() hasn't finished resolving yet — buffer
-				socket.data.clientBuf.push(Buffer.from(rawData).slice())
+				if (pendingSize(socket.data.clientBuf) + rawData.length > MAX_PENDING_BYTES) {
+					console.warn('[mysql:sni] client buffer overflow, dropping connection')
+					socket.end()
+					return
+				}
+				socket.data.clientBuf.push(Buffer.from(rawData))
 				return
 			}
 
@@ -387,7 +421,6 @@ export function startMysqlProxy(
 						const st = socket.data.state
 
 						if (st === 'wait_backend_greeting') {
-							// Backend sends HandshakeV10 — consume it, extract salt
 							const greeting = parseBackendHandshakeV10(Buffer.from(backData))
 							if (!greeting) {
 								console.error('[mysql:sni] failed to parse backend HandshakeV10')
@@ -395,11 +428,9 @@ export function startMysqlProxy(
 								return
 							}
 
-							// Always use mysql_native_password for the AuthSwitchRequest
 							const plugin = 'mysql_native_password'
 							socket.data.backendPlugin = plugin
 
-							// AuthSwitchRequest: seq = client's HandshakeResponse41 seq + 1
 							const switchSeq = (socket.data.savedClient?.seqId ?? 2) + 1
 							const authSwitch = buildAuthSwitchRequest(plugin, greeting.authPluginData, switchSeq)
 							socket.write(authSwitch)
@@ -412,7 +443,6 @@ export function startMysqlProxy(
 
 						if (st === 'piping') {
 							if (socket.data.isFirstBackendResponse) {
-								// Backend OK/Error at seq=2 → patch to client's expected seq
 								const clientSeq = (socket.data.savedClient?.seqId ?? 2) + 3
 								socket.data.isFirstBackendResponse = false
 								socket.write(patchSeq(backData, clientSeq))
@@ -453,31 +483,26 @@ export function startMysqlProxy(
 				maxPacketSize: info.maxPacketSize,
 			})
 
-			const back = socket.data.backend as any
-			if (!back) {
+			if (!socket.data.backend) {
 				console.warn('[mysql:sni] backend not ready for HandshakeResponse41')
 				socket.end()
 				return
 			}
 
-			back.write(resp)
+			socketWrite(socket.data.backend, resp)
 			socket.data.state = 'piping'
 			return
 		}
 
 		// ── Transparent post-auth pipe ────────────────────────────────
 		if (state === 'piping') {
-			const back = socket.data.backend as any
-			if (back) {
-				back.write(rawData)
+			if (socket.data.backend) {
+				socketWrite(socket.data.backend, rawData)
 			}
 		}
 	}
 
 	// ── Internal TLS Bridge (SNI mode) ──────────────────────────────────
-	// After TLS handshake, performs AuthSwitchRequest dance with the client
-	// (same as plaintext mode) so the client re-authenticates with the real
-	// backend salt. The backend's HandshakeV10 is consumed, not forwarded.
 	Bun.listen<TlsData>({
 		hostname: '127.0.0.1',
 		port: TLS_BRIDGE_PORT,
@@ -530,12 +555,13 @@ export function startMysqlProxy(
 					return
 				}
 
+				trackConnect('mysql_tls')
 				socket.data.resolvedBackend = backend
 				socket.data.handshakeResolved = true
 
 				// If client data arrived before resolve() completed, process it now
 				if (socket.data.clientBuf.length > 0) {
-					const buffered = Buffer.concat(socket.data.clientBuf.map((c: Uint8Array) => Buffer.from(c)))
+					const buffered = Buffer.concat(socket.data.clientBuf)
 					socket.data.clientBuf.length = 0
 					handleTlsClientData(socket, buffered)
 				}
@@ -546,7 +572,10 @@ export function startMysqlProxy(
 			},
 
 			close(socket) {
-				;(socket.data.backend as any)?.end?.()
+				if (socket.data.backend) {
+					socketEnd(socket.data.backend)
+					trackDisconnect('mysql_tls')
+				}
 			},
 
 			error(_, err) {
@@ -656,6 +685,7 @@ export function startMysqlProxy(
 								return
 							}
 
+							trackConnect('mysql_plain')
 							console.log(`[mysql:plain] ${id12} (${realUser}) -> ${backend.host}:${backend.port}`)
 
 							Bun.connect({
@@ -670,7 +700,6 @@ export function startMysqlProxy(
 										const st = socket.data.state
 
 										if (st === 'auth_switch_sent') {
-											// First packet from backend = HandshakeV10
 											const greeting = parseBackendHandshakeV10(Buffer.from(backData))
 											if (!greeting) {
 												console.error('[mysql:plain] failed to parse backend HandshakeV10')
@@ -681,8 +710,6 @@ export function startMysqlProxy(
 											const plugin = greeting.authPluginName
 											socket.data.backendPlugin = plugin
 
-											// Refuse caching_sha2_password without SSL
-											// (needs full auth over plaintext, which requires password in clear)
 											if (plugin === 'caching_sha2_password') {
 												console.warn(`[mysql:plain] ${id12}: caching_sha2_password requires SSL`)
 												socket.write(
@@ -694,11 +721,9 @@ export function startMysqlProxy(
 												return
 											}
 
-											// Send AuthSwitchRequest to client with real backend salt (seq=2)
 											const authSwitch = buildAuthSwitchRequest(plugin, greeting.authPluginData, 2)
 											socket.write(authSwitch)
 
-											// Save backend socket — we'll write to it when client responds
 											socket.data.backend = backSock as unknown as ReturnType<typeof Bun.connect>
 											socket.data.isFirstBackendResponse = true
 											return
@@ -706,8 +731,6 @@ export function startMysqlProxy(
 
 										if (st === 'piping') {
 											if (socket.data.isFirstBackendResponse) {
-												// First response from backend after auth = OK or Error
-												// Client is at seq=3 so expects seq=4 in response
 												socket.data.isFirstBackendResponse = false
 												socket.write(patchSeq(backData, 4))
 											} else {
@@ -716,7 +739,6 @@ export function startMysqlProxy(
 											return
 										}
 
-										// Flush any buffered post-handshake data
 										socket.write(backData)
 									},
 
@@ -743,8 +765,13 @@ export function startMysqlProxy(
 				// ── SNI/TLS bridge pipe ───────────────────────────────────
 				if (state === 'bridging') {
 					if (socket.data.bridge) {
-						;(socket.data.bridge as unknown as { write: (d: Uint8Array) => void }).write(rawData)
+						socketWrite(socket.data.bridge, rawData)
 					} else {
+						if (pendingSize(socket.data.pendingBuf) + rawData.length > MAX_PENDING_BYTES) {
+							console.warn('[mysql] bridge buffer overflow, dropping connection')
+							socket.end()
+							return
+						}
 						// Deep copy — Bun may reuse the rawData buffer after callback returns
 						socket.data.pendingBuf.push(Buffer.from(rawData))
 					}
@@ -756,7 +783,6 @@ export function startMysqlProxy(
 					const info = socket.data.savedClient!
 					const newAuthBytes = extractAuthBytes(Buffer.from(rawData))
 
-					// Build HandshakeResponse41 for backend with fresh auth bytes
 					const resp = buildHandshakeResponse41({
 						username: socket.data.realUser,
 						authResponse: newAuthBytes,
@@ -766,30 +792,31 @@ export function startMysqlProxy(
 						maxPacketSize: info.maxPacketSize,
 					})
 
-					const back = socket.data.backend as unknown as { write: (d: Buffer) => void } | null
-					if (!back) {
+					if (!socket.data.backend) {
 						console.warn('[mysql:plain] backend not ready for HandshakeResponse41')
 						socket.end()
 						return
 					}
 
-					back.write(resp)
+					socketWrite(socket.data.backend, resp)
 					socket.data.state = 'piping'
 					return
 				}
 
 				// ── Transparent post-auth pipe ────────────────────────────
 				if (state === 'piping') {
-					const back = socket.data.backend as unknown as { write: (d: Uint8Array) => void } | null
-					if (back) {
-						back.write(rawData)
+					if (socket.data.backend) {
+						socketWrite(socket.data.backend, rawData)
 					}
 				}
 			},
 
 			close(socket) {
-				;(socket.data.bridge as unknown as { end: () => void } | null)?.end()
-				;(socket.data.backend as unknown as { end: () => void } | null)?.end()
+				if (socket.data.bridge) socketEnd(socket.data.bridge)
+				if (socket.data.backend) {
+					socketEnd(socket.data.backend)
+					trackDisconnect('mysql_plain')
+				}
 			},
 
 			error(_, err) {
