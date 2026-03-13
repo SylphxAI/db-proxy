@@ -588,6 +588,16 @@ export function startMysqlProxy(
 					// SSLRequest → SNI/TLS mode
 					if (isSslRequest(d)) {
 						socket.data.state = 'bridging'
+
+						// Buffer any bytes beyond the 36-byte SSLRequest packet.
+						// When the client sends SSLRequest and immediately starts the TLS
+						// handshake, TCP may coalesce them into a single segment. Without
+						// this, the TLS ClientHello bytes are silently dropped and the
+						// handshake hangs indefinitely.
+						if (d.length > 36) {
+							socket.data.pendingBuf.push(Buffer.from(d.subarray(36)))
+						}
+
 						Bun.connect({
 							hostname: '127.0.0.1',
 							port: TLS_BRIDGE_PORT,
@@ -735,7 +745,8 @@ export function startMysqlProxy(
 					if (socket.data.bridge) {
 						;(socket.data.bridge as unknown as { write: (d: Uint8Array) => void }).write(rawData)
 					} else {
-						socket.data.pendingBuf.push(rawData.slice())
+						// Deep copy — Bun may reuse the rawData buffer after callback returns
+						socket.data.pendingBuf.push(Buffer.from(rawData))
 					}
 					return
 				}
