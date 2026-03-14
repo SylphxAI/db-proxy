@@ -11,6 +11,7 @@ spec:
   # Traffic enters via Hetzner Cloud LB (138.199.132.65):
   #   :5432 → NodePort 31232 → sylphx-db-proxy:5432 (Postgres SNI proxy)
   #   :3306 → NodePort 30484 → sylphx-db-proxy:3306 (MySQL SNI proxy)
+  #   :6379 → NodePort 30637 → sylphx-db-proxy:6379 (Redis SNI proxy)
   type: NodePort
   selector:
     app: sylphx-db-proxy
@@ -25,3 +26,8 @@ spec:
       protocol: TCP
       targetPort: 3306
       nodePort: 30484
+    - name: redis
+      port: 6379
+      protocol: TCP
+      targetPort: 6379
+      nodePort: 30637

@@ -19,41 +19,41 @@
  *   proxy's connection handling indefinitely.
  */
 
-import postgres from 'postgres'
-import { trackCacheHit, trackCacheMiss, trackResolverCall } from './metrics.ts'
+import postgres from "postgres";
+import { trackCacheHit, trackCacheMiss, trackResolverCall } from "./metrics.ts";
 
 export interface BackendTarget {
-	host: string
-	port: number
-	provider: 'cnpg' | 'percona'
+	host: string;
+	port: number;
+	provider: "cnpg" | "percona" | "redis";
 }
 
-const DB_URL = process.env.DATABASE_URL
-if (!DB_URL) throw new Error('DATABASE_URL is required')
+const DB_URL = process.env.DATABASE_URL;
+if (!DB_URL) throw new Error("DATABASE_URL is required");
 
 const sql = postgres(DB_URL, {
 	max: 20,
 	idle_timeout: 30,
 	connect_timeout: 10,
-})
+});
 
 // ── Validated ID format ──────────────────────────────────────────────────────
 
 /** A valid id12 is the first 12 hex chars of a UUID (without dashes). */
-const ID12_RE = /^[0-9a-f]{12}$/
+const ID12_RE = /^[0-9a-f]{12}$/;
 
 function isValidId12(id12: string): boolean {
-	return ID12_RE.test(id12)
+	return ID12_RE.test(id12);
 }
 
 // ── LRU + TTL cache ─────────────────────────────────────────────────────────
 
-type CacheEntry = { value: BackendTarget | null; expiresAt: number }
+type CacheEntry = { value: BackendTarget | null; expiresAt: number };
 
-const cache = new Map<string, CacheEntry>()
-const CACHE_HIT_TTL_MS = 60_000
-const CACHE_MISS_TTL_MS = 10_000
-const CACHE_MAX_ENTRIES = 1_000
+const cache = new Map<string, CacheEntry>();
+const CACHE_HIT_TTL_MS = 60_000;
+const CACHE_MISS_TTL_MS = 10_000;
+const CACHE_MAX_ENTRIES = 1_000;
 
 /**
  * LRU cache get. On access, deletes and re-inserts the entry so it moves
@@ -61,16 +61,16 @@ const CACHE_MAX_ENTRIES = 1_000
  * Returns undefined if not found or expired.
  */
 function cacheGet(id12: string): CacheEntry | undefined {
-	const entry = cache.get(id12)
-	if (!entry) return undefined
+	const entry = cache.get(id12);
+	if (!entry) return undefined;
 	if (entry.expiresAt <= Date.now()) {
-		cache.delete(id12)
-		return undefined
+		cache.delete(id12);
+		return undefined;
 	}
 	// Move to end (most-recently-used)
-	cache.delete(id12)
-	cache.set(id12, entry)
-	return entry
+	cache.delete(id12);
+	cache.set(id12, entry);
+	return entry;
 }
 
 /**
@@ -79,63 +79,63 @@ function cacheGet(id12: string): CacheEntry | undefined {
  */
 function cacheSet(id12: string, entry: CacheEntry): void {
 	// Delete first so re-insert goes to end
-	cache.delete(id12)
+	cache.delete(id12);
 	if (cache.size >= CACHE_MAX_ENTRIES) {
-		const lruKey = cache.keys().next().value
-		if (lruKey !== undefined) cache.delete(lruKey)
+		const lruKey = cache.keys().next().value;
+		if (lruKey !== undefined) cache.delete(lruKey);
 	}
-	cache.set(id12, entry)
+	cache.set(id12, entry);
 }
 
 /** Expose cache size for metrics endpoint */
 export function getCacheSize(): number {
-	return cache.size
+	return cache.size;
 }
 
 /** Deep health check — verifies the Platform DB connection is alive */
 export async function checkHealth(): Promise<boolean> {
 	try {
-		await withTimeout(sql`SELECT 1`, 3_000, 'health-check')
-		return true
+		await withTimeout(sql`SELECT 1`, 3_000, "health-check");
+		return true;
 	} catch {
-		return false
+		return false;
 	}
 }
 
 // ── Resolver timeout ────────────────────────────────────────────────────────
 
-const RESOLVE_TIMEOUT_MS = 5_000
+const RESOLVE_TIMEOUT_MS = 5_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
 	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+		const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
 		promise.then(
 			(v) => {
-				clearTimeout(timer)
-				resolve(v)
+				clearTimeout(timer);
+				resolve(v);
 			},
 			(e) => {
-				clearTimeout(timer)
-				reject(e)
+				clearTimeout(timer);
+				reject(e);
 			},
-		)
-	})
+		);
+	});
 }
 
 // ── Resolver ─────────────────────────────────────────────────────────────────
 
 export async function resolveDatabase(id12: string): Promise<BackendTarget | null> {
 	if (!isValidId12(id12)) {
-		console.warn(`[router] invalid id12 format: "${id12}"`)
-		return null
+		console.warn(`[router] invalid id12 format: "${id12}"`);
+		return null;
 	}
 
-	const cached = cacheGet(id12)
+	const cached = cacheGet(id12);
 	if (cached) {
-		trackCacheHit()
-		return cached.value
+		trackCacheHit();
+		return cached.value;
 	}
-	trackCacheMiss()
+	trackCacheMiss();
 
 	// Convert 12-char hex prefix to UUID range bounds for a proper PK index scan.
 	// Old approach: `WHERE id::text LIKE '...'` — casts UUID to text, can't use the
@@ -144,13 +144,13 @@ export async function resolveDatabase(id12: string): Promise<BackendTarget | nul
 	//
 	// id12 = "25e3b05c46dc" → lower: 25e3b05c-46dc-0000-0000-000000000000
 	//                        → upper: 25e3b05c-46dd-0000-0000-000000000000
-	const lower = `${id12.slice(0, 8)}-${id12.slice(8, 12)}-0000-0000-000000000000`
-	const num = BigInt(`0x${id12}`) + 1n
-	const nextHex = num.toString(16).padStart(12, '0')
-	const upper = `${nextHex.slice(0, 8)}-${nextHex.slice(8, 12)}-0000-0000-000000000000`
+	const lower = `${id12.slice(0, 8)}-${id12.slice(8, 12)}-0000-0000-000000000000`;
+	const num = BigInt(`0x${id12}`) + 1n;
+	const nextHex = num.toString(16).padStart(12, "0");
+	const upper = `${nextHex.slice(0, 8)}-${nextHex.slice(8, 12)}-0000-0000-000000000000`;
 
-	const t0 = performance.now()
-	let rows: { provider: string; cluster_name: string; host: string | null; port: number | null }[]
+	const t0 = performance.now();
+	let rows: { provider: string; cluster_name: string; host: string | null; port: number | null }[];
 	try {
 		rows = await withTimeout(
 			sql<{ provider: string; cluster_name: string; host: string | null; port: number | null }[]>`
@@ -161,43 +161,128 @@ export async function resolveDatabase(id12: string): Promise<BackendTarget | nul
 			`,
 			RESOLVE_TIMEOUT_MS,
 			`resolve(${id12})`,
-		)
-		trackResolverCall(performance.now() - t0)
+		);
+		trackResolverCall(performance.now() - t0);
 	} catch (err) {
-		trackResolverCall(performance.now() - t0, true)
-		throw err
+		trackResolverCall(performance.now() - t0, true);
+		throw err;
 	}
 
 	if (rows.length === 0) {
-		cacheSet(id12, { value: null, expiresAt: Date.now() + CACHE_MISS_TTL_MS })
-		return null
+		cacheSet(id12, { value: null, expiresAt: Date.now() + CACHE_MISS_TTL_MS });
+		return null;
 	}
 
-	const { provider, cluster_name, host, port } = rows[0]
+	const { provider, cluster_name, host, port } = rows[0];
 
 	// Use stored host/port when available (authoritative).
 	// Fallback to convention-based construction for backward compat.
-	let targetHost: string
-	let targetPort: number
+	let targetHost: string;
+	let targetPort: number;
 
 	if (host) {
-		targetHost = host
-		targetPort = port ?? (provider === 'percona' ? 3306 : 5432)
+		targetHost = host;
+		targetPort = port ?? (provider === "percona" ? 3306 : 5432);
 	} else {
 		targetHost =
-			provider === 'percona'
+			provider === "percona"
 				? `percona-haproxy.${cluster_name}.svc.cluster.local`
-				: `${cluster_name}-pooler.${cluster_name}.svc.cluster.local`
-		targetPort = provider === 'percona' ? 3306 : 5432
+				: `${cluster_name}-pooler.${cluster_name}.svc.cluster.local`;
+		targetPort = provider === "percona" ? 3306 : 5432;
 	}
 
 	const target: BackendTarget = {
 		host: targetHost,
 		port: targetPort,
-		provider: provider as 'cnpg' | 'percona',
+		provider: provider as "cnpg" | "percona",
+	};
+
+	cacheSet(id12, { value: target, expiresAt: Date.now() + CACHE_HIT_TTL_MS });
+	console.log(`[router] ${id12} → ${target.host}:${target.port}`);
+	return target;
+}
+
+// ── Redis cache (separate from database cache) ───────────────────────────────
+
+const redisCache = new Map<string, CacheEntry>();
+
+function redisCacheGet(id12: string): CacheEntry | undefined {
+	const entry = redisCache.get(id12);
+	if (!entry) return undefined;
+	if (entry.expiresAt <= Date.now()) {
+		redisCache.delete(id12);
+		return undefined;
+	}
+	redisCache.delete(id12);
+	redisCache.set(id12, entry);
+	return entry;
+}
+
+function redisCacheSet(id12: string, entry: CacheEntry): void {
+	redisCache.delete(id12);
+	if (redisCache.size >= CACHE_MAX_ENTRIES) {
+		const lruKey = redisCache.keys().next().value;
+		if (lruKey !== undefined) redisCache.delete(lruKey);
+	}
+	redisCache.set(id12, entry);
+}
+
+// ── Redis Resolver ────────────────────────────────────────────────────────────
+
+export async function resolveRedis(id12: string): Promise<BackendTarget | null> {
+	if (!isValidId12(id12)) {
+		console.warn(`[router:redis] invalid id12 format: "${id12}"`);
+		return null;
 	}
 
-	cacheSet(id12, { value: target, expiresAt: Date.now() + CACHE_HIT_TTL_MS })
-	console.log(`[router] ${id12} → ${target.host}:${target.port}`)
-	return target
+	const cached = redisCacheGet(id12);
+	if (cached) {
+		trackCacheHit();
+		return cached.value;
+	}
+	trackCacheMiss();
+
+	const lower = `${id12.slice(0, 8)}-${id12.slice(8, 12)}-0000-0000-000000000000`;
+	const num = BigInt(`0x${id12}`) + 1n;
+	const nextHex = num.toString(16).padStart(12, "0");
+	const upper = `${nextHex.slice(0, 8)}-${nextHex.slice(8, 12)}-0000-0000-000000000000`;
+
+	const t0 = performance.now();
+	let rows: { cluster_name: string; host: string | null; port: number | null }[];
+	try {
+		rows = await withTimeout(
+			sql<{ cluster_name: string; host: string | null; port: number | null }[]>`
+				SELECT cluster_name, host, port
+				FROM redis_resources
+				WHERE id >= ${lower}::uuid AND id < ${upper}::uuid
+				LIMIT 1
+			`,
+			RESOLVE_TIMEOUT_MS,
+			`resolveRedis(${id12})`,
+		);
+		trackResolverCall(performance.now() - t0);
+	} catch (err) {
+		trackResolverCall(performance.now() - t0, true);
+		throw err;
+	}
+
+	if (rows.length === 0) {
+		redisCacheSet(id12, { value: null, expiresAt: Date.now() + CACHE_MISS_TTL_MS });
+		return null;
+	}
+
+	const { cluster_name, host, port } = rows[0];
+
+	const targetHost = host ?? `redis-master.${cluster_name}.svc.cluster.local`;
+	const targetPort = port ?? 6379;
+
+	const target: BackendTarget = {
+		host: targetHost,
+		port: targetPort,
+		provider: "redis",
+	};
+
+	redisCacheSet(id12, { value: target, expiresAt: Date.now() + CACHE_HIT_TTL_MS });
+	console.log(`[router:redis] ${id12} → ${target.host}:${target.port}`);
+	return target;
 }
