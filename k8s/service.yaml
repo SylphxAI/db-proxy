@@ -6,17 +6,12 @@ metadata:
   labels:
     app: sylphx-db-proxy
     app.kubernetes.io/instance: db-proxy
-  annotations:
-    # Cilium L2 IPAM — shares the public-lb VIP (91.98.183.14) with main-gateway.
-    # External traffic enters via Hetzner Cloud LB (138.199.132.65):
-    #   :5432 → NodePort 31232 → sylphx-db-proxy:5432 (Postgres SNI proxy)
-    #   :3306 → NodePort 30484 → sylphx-db-proxy:3306 (MySQL SNI proxy)
-    io.cilium/lb-ipam-ips: "91.98.183.14"
-    lbipam.cilium.io/sharing-key: "public-lb"
 spec:
-  type: LoadBalancer
-  allocateLoadBalancerNodePorts: true
-  externalTrafficPolicy: Cluster
+  # NodePort (not LoadBalancer) — we don't need a Cilium L2 VIP.
+  # Traffic enters via Hetzner Cloud LB (138.199.132.65):
+  #   :5432 → NodePort 31232 → sylphx-db-proxy:5432 (Postgres SNI proxy)
+  #   :3306 → NodePort 30484 → sylphx-db-proxy:3306 (MySQL SNI proxy)
+  type: NodePort
   selector:
     app: sylphx-db-proxy
   ports:
