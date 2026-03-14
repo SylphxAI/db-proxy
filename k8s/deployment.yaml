@@ -5,6 +5,7 @@ metadata:
   namespace: sylphx-infra
   labels:
     app: sylphx-db-proxy
+    app.kubernetes.io/instance: db-proxy
 spec:
   replicas: 2
   selector:
@@ -83,7 +84,25 @@ spec:
             - name: tls-cert
               mountPath: /certs
               readOnly: true
+            - name: src-overlay
+              mountPath: /app/src/index.ts
+              subPath: index.ts
+            - name: src-overlay
+              mountPath: /app/src/mysql.ts
+              subPath: mysql.ts
+            - name: src-overlay
+              mountPath: /app/src/postgres.ts
+              subPath: postgres.ts
+            - name: src-overlay
+              mountPath: /app/src/router.ts
+              subPath: router.ts
+            - name: src-overlay
+              mountPath: /app/src/metrics.ts
+              subPath: metrics.ts
       volumes:
         - name: tls-cert
           secret:
             secretName: db-sylphx-net-wildcard-tls
+        - name: src-overlay
+          configMap:
+            name: db-proxy-src
