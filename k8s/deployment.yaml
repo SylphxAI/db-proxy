@@ -99,6 +99,9 @@ spec:
             - name: src-overlay
               mountPath: /app/src/metrics.ts
               subPath: metrics.ts
+            - name: src-overlay
+              mountPath: /app/src/redis.ts
+              subPath: redis.ts
       volumes:
         - name: tls-cert
           secret:
